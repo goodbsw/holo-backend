@@ -1,104 +1,115 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import Dict
-import os
-
-# AI Refine (기존 코드 유지를 가정)
+from app.database.crud import doc_prompts as crud_prompts
+from app.database.crud import chat as crud_chat
+from app.database.crud import documents as crud_documents
+from app.database import get_db
+from sqlalchemy.orm import Session
+from app.core.config import get_settings
 from openai import OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
+import markdown
+import difflib
 
-from docxtpl import DocxTemplate  # 서버단에서 DOCX 치환용
+settings = get_settings()
+client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
-router = APIRouter()
+router = APIRouter(prefix="/documents", tags=["documents"])
 
-DOCUMENTS_DIR = "/Users/seungweonbaek/Downloads"
+class GenerateDraftRequest(BaseModel):
+    session_id: str
+    case_type: str
+    doc_type: str
 
-# ------------------------------
-# 1) 템플릿 원본 문서 다운로드
-# ------------------------------
-@router.get("/documents/{filename}")
-async def get_document(filename: str):
-    """
-    DOCUMENTS_DIR 아래 있는 DOCX 문서를 직접 다운로드 (원본 템플릿 등)
-    """
-    file_path = os.path.join(DOCUMENTS_DIR, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
-    return FileResponse(file_path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename=filename)
-
-# ------------------------------
-# 2) AI 문맥 다듬기 API (기존)
-# ------------------------------
-class DocumentRefineRequest(BaseModel):
-    document_id: str
-    field_name: str
-    user_input: str
-
-@router.post("/documents/refine")
-async def refine_document(request: DocumentRefineRequest):
+@router.post("/generate_draft")
+async def generate_draft(request: GenerateDraftRequest, db: Session = Depends(get_db)):
     """
     사용자가 입력한 문서 필수 항목을 ChatGPT를 이용하여 문맥을 다듬어 반환
     """
-    try:
-        prompt = f"""
-        다음 문서 필수 항목을 법리적으로 더 적합한 문맥으로 다듬어 주세요.
-        
-        문서 ID: {request.document_id}
-        필드명: {request.field_name}
-        사용자 입력: {request.user_input}
-        
-        법률 문서 스타일을 유지하면서 보다 정확하고 전문적인 문맥으로 변환해 주세요.
-        - 문서 ID, 필드명, 사용자 입력이라는 키워드는 포함하지 않아야합니다.
-        - 필드명과 사용자 입력의 내용이 포함되어야 합니다.
-        """
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",  # 예시 모델명
-            messages=[
-                {"role": "system", "content": "당신은 비법조인의 법적 문서 작성을 도와주는 법률 전문가입니다."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=500,
-            temperature=0.7,
-        )
-        refined_text = response.choices[0].message.content.strip()
-        return {"refined_text": refined_text}
+    session_id = request.session_id
+    case_type = request.case_type
+    doc_type = request.doc_type
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ChatGPT 요청 실패: {str(e)}")
+    doc_prompt = crud_prompts.get_doc_prompt(db, case_type, doc_type)
+    if not doc_prompt:
+        raise HTTPException(status_code=404, detail="문서 유형을 찾을 수 없습니다.")
+    
+    messages = [{"role": "system", "content": doc_prompt["prompt_text"]}]
 
+    chat_history = crud_chat.get_chat_history(db, session_id)
+    for message in chat_history:
+        messages.append({
+            "role": message["role"],
+            "content": message["content"]
+        })
 
-# ------------------------------
-# 3) 최종 문서 생성 API
-# ------------------------------
-class DocumentGenerateRequest(BaseModel):
-    template_filename: str
-    user_inputs: Dict[str, str]
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        max_tokens=500,
+        temperature=0.7,
+    )
 
-@router.post("/documents/generate")
-async def generate_document(req: DocumentGenerateRequest):
+    draft = markdown.markdown(response.choices[0].message.content)
+    crud_documents.create_draft(db, session_id, doc_type, draft)
+
+    return {"session_id": session_id, "draft": draft}
+
+class UpdateDraftRequest(BaseModel):
+    session_id: str
+
+def get_text_changes(old_text: str, new_text: str) -> dict:
+    """텍스트 간의 차이점을 찾아 반환"""
+    differ = difflib.SequenceMatcher(None, old_text, new_text)
+    changes = []
+    
+    for tag, i1, i2, j1, j2 in differ.get_opcodes():
+        if tag != 'equal':  # 변경된 부분만 추출
+            changes.append({
+                'type': tag,  # 'replace', 'delete', 'insert' 중 하나
+                'oldText': old_text[i1:i2],
+                'newText': new_text[j1:j2],
+                'position': {'start': i1, 'end': i2}
+            })
+    
+    return {'changes': changes}
+
+@router.post("/update_draft")
+async def update_draft(request: UpdateDraftRequest, db: Session = Depends(get_db)):
     """
-    1) DOCUMENTS_DIR 아래에 있는 템플릿 DOCX 파일을 불러옴
-    2) docxtpl 로 placeholders 치환
-    3) 치환된 문서를 임시 파일로 저장 후, 해당 파일을 FileResponse 로 반환
+    사용자가 입력한 문서 필수 항목을 ChatGPT를 이용하여 문맥을 다듬어 반환
     """
-    template_path = os.path.join(DOCUMENTS_DIR, req.template_filename)
-    if not os.path.exists(template_path):
-        raise HTTPException(status_code=404, detail="DOCX 템플릿을 찾을 수 없습니다.")
+    draft = crud_documents.get_draft(db, request.session_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+    
+    old_content = draft["content"]
+    session_id = request.session_id
+    
+    messages = [
+        {"role": "system", "content": '''
+            1. 사용자의 수정 요청을 반영하여 초안을 수정하여 반환해주세요.
+            2. 수정 요청 외에는 초안을 그대로 반환해주세요.
+        '''},
+        {"role": "user", "content": f"Draft content: {old_content}"}
+    ]
 
-    try:
-        doc = DocxTemplate(template_path)
-        doc.render(req.user_inputs)
-        output_filename = f"generated_{req.template_filename}"
-        output_path = os.path.join(DOCUMENTS_DIR, output_filename)
-        doc.save(output_path)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        max_tokens=500,
+        temperature=0.7,
+    )
 
-        return FileResponse(
-            path=output_path,
-            filename=output_filename,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
+    updated_draft = markdown.markdown(response.choices[0].message.content)
+    crud_documents.update_draft(db, request.session_id, updated_draft)
+    
+    # 변경사항 찾기
+    changes = get_text_changes(old_content, updated_draft)
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DOCX 템플릿 치환 실패: {str(e)}")
+    return {
+        "session_id": session_id,
+        "updated_draft": updated_draft,
+        "changes": changes,
+        "message": "요청하신 내용을 반영하여 수정하였습니다."
+    }
